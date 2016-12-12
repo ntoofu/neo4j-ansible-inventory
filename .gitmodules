@@ -1,0 +1,3 @@
+[submodule "ansibleutils"]
+	path = ansibleutils
+	url = https://github.com/ntoofu/ansible-inventory-utils

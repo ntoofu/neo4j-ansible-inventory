@@ -67,7 +67,7 @@ def query_subvars(node_id):
     cypher = "MATCH (a)-[p]->(b:{0}) WHERE ID(a) = {{id}}"\
              " RETURN type(p) as label, (p.index is not null) as islist,"\
              " b as var order by p.index".format(conf.vars_label)
-    sub_vars = session.run(, {"id": node_id})
+    sub_vars = session.run(cypher, {"id": node_id})
     var = {}
     for sub_var in sub_vars:
         var_name = sub_var["label"]

@@ -1,130 +1,92 @@
 import utils
-import conf
+import definition
+
+class Neo4jToAnsible:
+
+    def __init__(self, definition=definition.Definition()):
+        self.definition = definition
+        self._rel_label = definition.relation_label
+        self._rep_label = definition.representing_node.label
+        self._rep_rel_label = definition.rep_rel_label
+        self._rep_name = definition.representing_node.name
+        self._name_rule = definition.node_name_rule
+
+    def list_inventory(self, session):
+        node_info = {}
+
+        # find the representing node
+        cypher = "MATCH (a:{0} {{name: {{name}} }}) RETURN ID(a) as id".format(self._rep_label)
+        rep_node = session.run(cypher, {"name": self._rep_name}).peek()
+        rep_id = rep_node["id"]
+
+        # find all nodes used in this ansible inventory
+        cypher = "MATCH (a)<-[:{0}]-(b) WHERE ID(b) = {{id}} RETURN ID(a) as id, a.name as name, LABELS(a) as label".format(self._rep_rel_label)
+        all_nodes = session.run(cypher, {"id": rep_id})
+        neo4j_node_list = [definition.Neo4jNodeInfo(x["label"][0], x["name"], id=x["id"]) for x in all_nodes]
+
+        # create dictionary whose structure is equivalent to the dynamic inventory
+        groups = {}
+        hostvars = {}
+        for neo4j_node in neo4j_node_list:
+            node = self._name_rule(neo4j_node)
+
+            # get variables
+            var = {} # TODO: implement
+
+            if node.ansible_is_host:
+                hostvars[node.ansible_name] = var
+            else:
+                # find child_groups of the node
+                cypher = "MATCH (a)-[:{0}]->(b)<-[:{1}]-(c)" \
+                         " WHERE ID(a) = {{id}} AND ID(c) = {{rep_id}}"\
+                         " RETURN b.name as name, LABELS(b) as label".format(self._rel_label, self._rep_rel_label)
+                results = session.run(cypher, {"id": neo4j_node.id, "rep_id": rep_id})
+                children = [self._name_rule(definition.Neo4jNodeInfo(x["label"][0], x["name"])) for x in results]
+                groups[node.ansible_name] = { "vars": var,
+                                              "hosts": [x.ansible_name for x in children if x.ansible_is_host],
+                                              "children": [x.ansible_name for x in children if not x.ansible_is_host] }
+        groups["_meta"] = {"hostvars": hostvars}
+        return groups
 
 
-def list_inventory(session):
-    node_info = {}
-
-    def scan_node(neo4j_id):
-        cypher = "MATCH (a) WHERE ID(a) = {id} RETURN a as property"
-        group = session.run(cypher, {"id": neo4j_id})
-        group_prop = group.peek()["property"]
-        group_key = group_prop["name"]
-        cypher = "MATCH (a)-[:{0}]->(b:{1}) WHERE ID(a) = {{id}}" \
-                 " RETURN ID(b) as id".format(conf.relation_label,
-                                              conf.group_label)
-        children = session.run(cypher, {"id": neo4j_id})
-        children_id = [x["id"] for x in children]
-        cypher = "MATCH (a)-[:{0}]->(b:{1}) WHERE ID(a) = {{id}}" \
-                 " RETURN b.name as name".format(conf.relation_label,
-                                                 conf.host_label)
-        hosts = session.run(cypher, {"id": neo4j_id})
-        hosts_name = [x["name"] for x in hosts]
-        node_info[neo4j_id] = {
-                "key": group_key,
-                "vars": dict(group_prop),
-                "hosts": hosts_name,
-                "children_id": children_id
-        }
-        for i in children_id:
-            if i not in node_info.keys():
-                scan_node(i)
-        return
-
-    # find the group "all" as root node
-    cypher = "MATCH (a:{0} {{name: 'all'}})" \
-             " RETURN ID(a) as id".format(conf.group_label)
-    root_node = session.run(cypher)
-    root_node_id = root_node.peek()["id"]
-
-    scan_node(root_node_id)
-
-    # change structure of node_info to appropreate one
-    # for ansible dynamic inventory
-    group_inventory = {}
-    for key, val in node_info.items():
-        # remove "name" vars because it is inserted by store.py
-        # to handle nodes in neo4j
-        if "name" in val["vars"].keys():
-            del val["vars"]["name"]
-        # search sub var
-        sub_vars = query_subvars(key)
-        group_inventory[val["key"]] = {
-                "vars": {k: v for dic in [val["vars"], sub_vars]
-                         for k, v in dic.items()},
-                "hosts": val["hosts"],
-                "children": [node_info[x]["key"]
-                             for x in val["children_id"]]
-                }
-    group_inventory["ungrouped"] = []
-
-    # add '_meta' information
-    group_inventory["_meta"] = {"hostvars": list_all_hostvars(session)}
-    return group_inventory
+    def _query_subvars(self, node_id):
+        cypher = "MATCH (a)-[p]->(b:{0}) WHERE ID(a) = {{id}}"\
+                 " RETURN type(p) as label, (p.index is not null) as islist,"\
+                 " b as var order by p.index".format(conf.vars_label)
+        sub_vars = session.run(cypher, {"id": node_id})
+        var = {}
+        for sub_var in sub_vars:
+            var_name = sub_var["label"]
+            if sub_var["islist"]:
+                if var_name not in var.keys():
+                    var[var_name] = []
+                var[var_name].append(dict(sub_var["var"]))
+            else:
+                var[var_name] = dict(sub_var["var"])
+        return var
 
 
-def query_subvars(node_id):
-    cypher = "MATCH (a)-[p]->(b:{0}) WHERE ID(a) = {{id}}"\
-             " RETURN type(p) as label, (p.index is not null) as islist,"\
-             " b as var order by p.index".format(conf.vars_label)
-    sub_vars = session.run(cypher, {"id": node_id})
-    var = {}
-    for sub_var in sub_vars:
-        var_name = sub_var["label"]
-        if sub_var["islist"]:
-            if var_name not in var.keys():
-                var[var_name] = []
-            var[var_name].append(dict(sub_var["var"]))
-        else:
-            var[var_name] = dict(sub_var["var"])
-    return var
+    def list_hostvars(self, session, hostname):
+        # find the group "all" as root node
+        cypher = "MATCH (a:{0} {{name: 'all'}})" \
+                 " RETURN ID(a) as id".format(conf.group_label)
+        root_node = session.run(cypher)
+        root_node_id = root_node.peek()["id"]
 
-
-def list_hostvars(session, hostname):
-    # find the group "all" as root node
-    cypher = "MATCH (a:{0} {{name: 'all'}})" \
-             " RETURN ID(a) as id".format(conf.group_label)
-    root_node = session.run(cypher)
-    root_node_id = root_node.peek()["id"]
-
-    cypher = "MATCH (a)-[:{0}*]->(b:{1} {{name: {{name}}}})" \
-             " WHERE ID(a) = {{id}} RETURN ID(b) AS id," \
-             " b AS property".format(conf.relation_label, conf.host_label)
-    host_result = session.run(cypher, {"name": hostname, "id": root_node_id})
-    host = host_result.peek()
-    host_prop = dict(host["property"])
-    # remove "name" vars because it is inserted by store.py
-    # to handle nodes in neo4j
-    if "name" in host_prop.keys():
-        del host_prop["name"]
-    sub_vars = query_subvars(host["id"])
-    hostvars = {k: v for dic in [host_prop, sub_vars] for k, v in dic.items()}
-    return hostvars
-
-
-def list_all_hostvars(session):
-    # find the group "all" as root node
-    cypher = "MATCH (a:{0} {{name: 'all'}})" \
-             " RETURN ID(a) as id".format(conf.group_label)
-    root_node = session.run(cypher)
-    root_node_id = root_node.peek()["id"]
-
-    cypher = "MATCH (a)-[:{0}*]->(b:{1}) WHERE ID(a) = {{id}}" \
-             " RETURN ID(b) as id, b AS property".format(conf.relation_label,
-                                                         conf.host_label)
-    hosts = session.run(cypher, {"id": root_node_id})
-    hostvars = {}
-    for host in hosts:
+        cypher = "MATCH (a)-[:{0}*]->(b:{1} {{name: {{name}}}})" \
+                 " WHERE ID(a) = {{id}} RETURN ID(b) AS id," \
+                 " b AS property".format(conf.relation_label, conf.host_label)
+        host_result = session.run(cypher, {"name": hostname, "id": root_node_id})
+        host = host_result.peek()
         host_prop = dict(host["property"])
         # remove "name" vars because it is inserted by store.py
         # to handle nodes in neo4j
         if "name" in host_prop.keys():
             del host_prop["name"]
-        sub_vars = query_subvars(host["id"])
-        host_key = host["property"]["name"]
-        hostvars[host_key] = {k: v for dic in [host_prop, sub_vars]
-                              for k, v in dic.items()}
-    return hostvars
+        sub_vars = self._query_subvars(host["id"])
+        hostvars = {k: v for dic in [host_prop, sub_vars] for k, v in dic.items()}
+        return hostvars
+
 
 
 if __name__ == "__main__":
@@ -174,9 +136,11 @@ if __name__ == "__main__":
                                           args.neo4j_password)
     session = neo4j_driver.session()
 
+    dynamic_inventory = Neo4jToAnsible()
+
     if args.host:
-        print(json.dumps(list_hostvars(session, args.host)))
+        print(json.dumps(dynamic_inventory.list_hostvars(session, args.host)))
     elif args.list:
-        print(json.dumps(list_inventory(session)))
+        print(json.dumps(dynamic_inventory.list_inventory(session)))
 
     session.close()

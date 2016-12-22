@@ -1,125 +1,130 @@
 import utils
-import conf
 import neo4j.v1.exceptions
+from definition import Neo4jNode, Definition
+
+class AnsibleToNeo4j:
+    def __init__(self, definition=Definition()):
+        self.definition = definition
+        self._rel_label = definition.relation_label
+        self._rep_label = definition.representing_node.label
+        self._rep_rel_label = definition.rep_rel_label
+        self._rep_name = definition.representing_node.name
+        self._name_rule = definition.node_name_rule
+        self._vars_label = definition.vars_label
+        self._vars_rule = definition.vars_rule
+
+    def _parse_inventory(self, inventory):
+        uuid_to_node = {}
+        # create all nodes
+        ansible_to_node = {}
+        hosts = set()
+        for groupname, group in inventory.groups.items():
+            ansible_to_node[("group",groupname)] = Neo4jNode()
+            hosts |= set(group.hosts)
+        for host in hosts:
+            ansible_to_node[("host",host.name)] = Neo4jNode()
+
+        # setup all nodes
+        for ans_type, ans_nodes in {"group": inventory.groups.values(), "host": hosts}.items():
+            for ans_node in ans_nodes:
+                node = ansible_to_node[(ans_type,ans_node.name)]
+                namerule = self._name_rule(ans_node)
+                node.name = namerule.neo4j_name
+                node.label = namerule.neo4j_label
+                node.vars = self._vars_rule.from_ansible(node.name, node.label, ans_node)
+                if ans_type == "group":
+                    node.childnodes = [ansible_to_node[("group",g.name)].uuid for g in ans_node.child_groups]
+                    node.childnodes.extend([ansible_to_node[("host",h.name)].uuid for h in ans_node.hosts])
+                uuid_to_node[node.uuid] = node
+
+        return uuid_to_node
 
 
-def _parse_inventory(inventory):
+    def _create_inventory_in_neo4j(self, nodes, session):
+        # create inventory unique node
+        cypher = "CREATE (a:{0} {{name: {{rep_name}}}}) RETURN ID(a) as id".format(self._rep_label)
+        result = session.run(cypher, {"rep_name": self._rep_name})
+        rep_id = result.peek()["id"]
 
-    node_info = {}
-    hosts = set()
-    # retrieve all groups
-    for groupname, group in inventory.groups.items():
-        node_name = groupname
+        # create all nodes and store node id
+        for uuid, node in nodes.items():      # iterate over ["host","group"]
+            cypher = "MATCH (b) WHERE ID(b) = {{id}} CREATE (a:{0} {{name:{{name}}}})<-[:{1}]-(b)" \
+                     " RETURN ID(a) as id".format(node.label, self._rep_rel_label)
+            created_node = session.run(cypher, {"name": node.name, "id": rep_id})
+            node.id = created_node.peek()["id"]
 
-        # store all node data into 'node_info'
-        children = [child.name for child in group.child_groups
-                    if child.name is not "ungrouped"]
-        children.extend([host.name for host in group.hosts])
-        node_info[groupname] = {
-                "name": node_name,
-                "label": conf.group_label,
-                "vars": group.vars,
-                "child_keys": children,
-                "is_host": False,
-                "neo4j_id": None
-                }
+        # create all pathes
+        for uuid, node in nodes.items():
+            parent_id = node.id
+            for child_uuid in node.childnodes:
+                child_id = nodes[child_uuid].id
+                cypher = "MATCH (p),(c)" \
+                         " WHERE ID(p) = {{pid}} AND ID(c) = {{cid}}" \
+                         " CREATE (p) -[:{0}]->(c)".format(self._rel_label)
+                session.run(cypher, {"pid": parent_id, "cid": child_id})
 
-        # cache hosts
-        hosts |= set(group.hosts)
+        # create all vars
+        for uuid, node in nodes.items():
+            self._set_vars(node.id, node.vars, session)
 
-    # append hosts to 'node_info'
-    for host in hosts:
-        node_info[host.name] = {
-                "name": host.name,
-                "label": conf.host_label,
-                "vars": host.vars,
-                "child_keys": [],
-                "is_host": True,
-                "neo4j_id": None
-                }
-
-    return node_info
+        return
 
 
-def _create_inventory_tree_in_neo4j(node_info, session):
-    # create all nodes and store node id
-    for key, node in node_info.items():
-        cypher = "CREATE (a:{0} {{name:{{name}}}})" \
-                 " RETURN ID(a) as id".format(node["label"])
-        created_node = session.run(cypher, {"name": node["name"]})
-        node["neo4j_id"] = created_node.peek()["id"]
-
-    # create all pathes
-    for key, node in node_info.items():
-        parent_id = node["neo4j_id"]
-        for child_key in node["child_keys"]:
-            child_id = node_info[child_key]["neo4j_id"]
-            cypher = "MATCH (p),(c)" \
-                     " WHERE ID(p) = {{pid}} AND ID(c) = {{cid}}" \
-                     " CREATE (p) -[:{0}]->(c)".format(conf.relation_label)
-            session.run(cypher, {"pid": parent_id, "cid": child_id})
-
-    return
-
-
-def _create_subelement(session, key, var, node_id, path_idx=None):
-    pass
-    query_str = ", ".join(["{0}: {{val}}.{0}".format(k) for k in var.keys()])
-    cypher = "MATCH (a:{0} {{{1}}})" \
-             " RETURN ID(a) as id".format(conf.vars_label, query_str)
-    vars_node = session.run(cypher, {"val": dict(var)})
-    try:
-        vars_node_id = vars_node.peek()["id"]
-    except neo4j.v1.exceptions.ResultError:
-        cypher = "CREATE (a:{0} {{val}})" \
-                 " RETURN ID(a) as id".format(conf.vars_label)
+    def _create_subelement(self, session, key, var, node_id, path_idx=None):
+        query_str = ", ".join(["{0}: {{val}}.{0}".format(k) for k in var.keys()])
+        cypher = "MATCH (a:{0} {{{1}}})" \
+                 " RETURN ID(a) as id".format(self._vars_label, query_str)
         vars_node = session.run(cypher, {"val": dict(var)})
-        vars_node_id = vars_node.peek()["id"]
-    if path_idx is None:
-        cypher = "MATCH (a), (b) WHERE ID(a) = {{nid}} AND ID(b) = {{vid}}" \
-                 " CREATE (a)-[:{0}]->(b)".format(key)
-    else:
-        cypher = "MATCH (a), (b) WHERE ID(a) = {{nid}} AND ID(b) = {{vid}}" \
-                 " CREATE (a)-[:{0} {{index: {1}}}]->(b)".format(key, path_idx)
-    session.run(cypher, {"nid": node_id, "vid": vars_node_id})
+        try:
+            vars_node_id = vars_node.peek()["id"]
+        except neo4j.v1.exceptions.ResultError:
+            cypher = "CREATE (a:{0} {{val}})" \
+                     " RETURN ID(a) as id".format(self._vars_label)
+            vars_node = session.run(cypher, {"val": dict(var)})
+            vars_node_id = vars_node.peek()["id"]
+        if path_idx is None:
+            cypher = "MATCH (a), (b) WHERE ID(a) = {{nid}} AND ID(b) = {{vid}}" \
+                     " CREATE (a)-[:{0}]->(b)".format(key)
+        else:
+            cypher = "MATCH (a), (b) WHERE ID(a) = {{nid}} AND ID(b) = {{vid}}" \
+                     " CREATE (a)-[:{0} {{index: {1}}}]->(b)".format(key, path_idx)
+        session.run(cypher, {"nid": node_id, "vid": vars_node_id})
 
 
-def _set_vars_to_neo4j(node_info, session):
-    import collections
+    def _set_vars(self, node_id, kvs, session):
+        import collections
 
-    def _type_sanitize(var):
-        if True in [isinstance(var, var_type)
-                    for var_type in [int, float, str, bool]]:
-            return var
-        if isinstance(var, collections.Sequence):
-            types = set([type(elem) for elem in var])
-            if len(types) > 1 or isinstance(var[0], collections.Container):
-                return [str(elem) for elem in var]
-            return var
-        return str(var)
+        def _type_sanitize(var):
+            if True in [isinstance(var, var_type)
+                        for var_type in [int, float, str, bool]]:
+                return var
+            if isinstance(var, collections.Sequence):
+                types = set([type(elem) for elem in var])
+                if len(types) > 1 or isinstance(var[0], collections.Container):
+                    return [str(elem) for elem in var]
+                return var
+            return str(var)
 
-    for nodename, node in node_info.items():
-        for k, v in node["vars"].items():
+        for k, v in kvs.items():
             if isinstance(v, collections.Mapping):
-                _create_subelement(session, k, v, node["neo4j_id"])
+                self._create_subelement(session, k, v, node_id)
             elif (isinstance(v, collections.Sequence) and
                   len(set([type(w) for w in v])) == 1 and
                   isinstance(v[0], collections.Mapping)):
                 for i, w in enumerate(v):
-                    _create_subelement(session, k, w, node["neo4j_id"], i)
+                    self._create_subelement(session, k, w, node_id, i)
             else:
                 plain_val = _type_sanitize(v)
                 cypher = "MATCH (a) WHERE ID(a) = {{id}}" \
                          " SET a.{0} = {{val}}".format(k)
-                session.run(cypher, {"id": node["neo4j_id"], "val": plain_val})
+                session.run(cypher, {"id": node_id, "val": plain_val})
 
 
-def store(session, inventory):
-    node_info = _parse_inventory(inventory)
-    utils.reset_db(session)
-    _create_inventory_tree_in_neo4j(node_info, session)
-    _set_vars_to_neo4j(node_info, session)
-    return
+    def store(self, session, inventory):
+        node_info = self._parse_inventory(inventory)
+        utils.reset_db(session)
+        self._create_inventory_in_neo4j(node_info, session)
+        return
 
 if __name__ == "__main__":
     import argparse
@@ -177,5 +182,6 @@ if __name__ == "__main__":
                                        args.inventory,
                                        args.vault_password)
     session = neo4j_driver.session()
-    store(session, inventory)
+    a2n = AnsibleToNeo4j()
+    a2n.store(session, inventory)
     session.close()

@@ -1,7 +1,7 @@
 from abc import ABCMeta, abstractmethod, abstractclassmethod
 from ansible.inventory.host import Host
 from ansible.inventory.group import Group
-import uuid, collections
+import uuid, collections, re
 
 
 class Neo4jNode:
@@ -27,6 +27,9 @@ class BaseNodeNameRule(metaclass=ABCMeta):
         elif isinstance(obj, Group):
             self.type = self.__class__._type_from_ansible(obj.name, False)
             self.name = self.__class__._name_from_ansible(obj.name, False)
+        elif isinstance(obj, Neo4jNode):
+            self.type = self.__class__._type_from_neo4j(obj.label, obj.name)
+            self.name = self.__class__._name_from_neo4j(obj.label, obj.name)
         else:
             raise TypeError("not support")
 
@@ -106,58 +109,56 @@ class Matcher(object):
     def __init__(self, name_re, label_re):
         self._name_re = re.compile(name_re)
         self._label_re = re.compile(label_re)
-        self._hash = (name_re, label_re)
+        self._hash = (name_re, label_re).__hash__()
 
     def __hash__(self):
         return self._hash
 
-    def matches(self, neo4j_node):
-        return self._name_re.match(neo4j_node.name) != None and self._label_re.match(neo4j_node.label) != None
+    def matches(self, name, label):
+        return self._name_re.match(name) != None and self._label_re.match(label) != None
 
 
-class RetrieveVar(object):
-    def __init__(self, key, from_ansible, from_neo4j):
-        self._key = key
+class VarsQuerier(object):
+    def __init__(self, from_ansible, from_neo4j):
         self._from_ansible = from_ansible
         self._from_neo4j = from_neo4j
 
     def from_ansible(self, ansible_obj):
         if isinstance(ansible_obj, Host) or isinstance(ansible_obj, Group):
-            return {self._key: self._from_ansible(ansible_obj.vars)}
+            return self._from_ansible(ansible_obj)
         else:
             raise TypeError("not support")
 
     def from_neo4j(self, neo4j_id, session):
-        return {self._key: self._from_ansible(neo4j_id, session)}
+        return self._from_neo4j(neo4j_id, session)
+
 
 class VarsRule(object):
     def __init__(self):
         self._rules = {}
 
-    def register(self, matcher, retrievevar):
-        if not isinstance(matcher, Matcher) or not isinstance(retrievevar, RetrieveVar):
+    def register(self, matcher, vars_querier):
+        if not isinstance(matcher, Matcher) or not isinstance(vars_querier, VarsQuerier):
             raise TypeError("not support")
         if matcher not in self._rules.keys():
             self._rules[matcher] = []
-        self._rules[matcher].append(retrievevar)
+        self._rules[matcher].append(vars_querier)
         return
 
     def from_ansible(self, name, label, ansible_obj):
         kvs = {}
-        for k,v in self._rules.items():
-            if not k.matches(name, label):
+        for matcher, queiers in self._rules.items():
+            if not matcher.matches(name, label):
                 continue
-            kv = v.from_ansible(ansible_obj)
-            kvs[kv.k] = v
+            kvs = {k: v for q in queiers for k, v in q.from_ansible(ansible_obj).items()}
         return kvs
 
     def from_neo4j(self, neo4jnode, session):
         kvs = {}
-        for k,v in self._rules.items():
-            if not k.matches(neo4jnode.name, neo4jnode.label):
+        for matcher,queiers in self._rules.items():
+            if not matcher.matches(neo4jnode.name, neo4jnode.label):
                 continue
-            kv = v.from_neo4j(neo4jnode.id, session)
-            kvs[kv.k] = v
+            kvs = {k: v for q in queiers for k, v in q.from_neo4j(neo4jnode.id, session).items()}
         return kvs
 
 
@@ -169,3 +170,41 @@ class Definition:
         self.node_name_rule = node_name_rule
         self.vars_rule = vars_rule
         self.vars_label = vars_label
+
+
+def SimpleAnsibleQuerierFactory(ansible_key, neo4j_key):
+    return (lambda ans_obj: {neo4j_key: ans_obj.vars.get(ansible_key, None)})
+
+
+def SimpleNeo4jQuerierFactory(neo4j_key, ansible_key):
+    cache = {}
+
+    def _impl(node_id, session, neo4j_key, ansible_key):
+        if(node_id not in cache.keys()):
+            result = session.run("MATCH (a) WHERE ID(a) = {0} RETURN a AS property".format(node_id))
+            cache[node_id] = result.peek()['property']
+        return {ansible_key: cache[node_id].get(neo4j_key, None)}
+
+    return lambda node_id, session: _impl(node_id, session, neo4j_key, ansible_key)
+
+
+def all_ansible_querier_factory():
+    return (lambda ans_obj: dict(ans_obj.vars))
+
+
+def all_neo4j_querier_factory():
+    def _impl(node_id, session):
+        result = session.run("MATCH (a) WHERE ID(a) = {0} RETURN a AS property".format(node_id))
+        props = result.peek()['property']
+        result = session.run("MATCH (a)-[p]->(b) WHERE ID(a) = {0} RETURN p.name AS key, b AS subprop, p.index AS idx ORDER BY TYPE(p), p.index".format(node_id))
+        subprops = {}
+        for r in result:
+            if r["idx"] is None:
+                subprops[r["key"]] = dict(r["subprop"])
+            else:
+                if r["idx"] == 0:
+                    subprops[r["key"]] = []
+                subprops[r["key"]].append(dict(r["subprop"]))
+        return dict(props)
+    return _impl
+

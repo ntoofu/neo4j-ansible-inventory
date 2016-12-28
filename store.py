@@ -1,6 +1,7 @@
 import utils
 import neo4j.v1.exceptions
 from definition import Neo4jNode, Definition
+from config import user_def
 
 class AnsibleToNeo4j:
     def __init__(self, definition=Definition()):
@@ -83,12 +84,13 @@ class AnsibleToNeo4j:
             vars_node = session.run(cypher, {"val": dict(var)})
             vars_node_id = vars_node.peek()["id"]
         if path_idx is None:
-            cypher = "MATCH (a), (b) WHERE ID(a) = {{nid}} AND ID(b) = {{vid}}" \
-                     " CREATE (a)-[:{0}]->(b)".format(key)
+            cypher = "MATCH (a), (b) WHERE ID(a) = {nid} AND ID(b) = {vid}" \
+                     " CREATE (a)-[p:ANSIBLE_VARS {name:{path_name}}]->(b)"
+            session.run(cypher, {"nid": node_id, "vid": vars_node_id, "path_name": key})
         else:
-            cypher = "MATCH (a), (b) WHERE ID(a) = {{nid}} AND ID(b) = {{vid}}" \
-                     " CREATE (a)-[:{0} {{index: {1}}}]->(b)".format(key, path_idx)
-        session.run(cypher, {"nid": node_id, "vid": vars_node_id})
+            cypher = "MATCH (a), (b) WHERE ID(a) = {nid} AND ID(b) = {vid}" \
+                     " CREATE (a)-[p:ANSIBLE_VARS {name:{path_name}, index:{path_index}}]->(b)"
+            session.run(cypher, {"nid": node_id, "vid": vars_node_id, "path_name": key, "path_index": path_idx})
 
 
     def _set_vars(self, node_id, kvs, session):
@@ -182,6 +184,6 @@ if __name__ == "__main__":
                                        args.inventory,
                                        args.vault_password)
     session = neo4j_driver.session()
-    a2n = AnsibleToNeo4j()
+    a2n = AnsibleToNeo4j(user_def)
     a2n.store(session, inventory)
     session.close()

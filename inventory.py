@@ -1,15 +1,18 @@
 import utils
-import definition
+from definition import Neo4jNode, Definition
+from config import user_def
 
 class Neo4jToAnsible:
 
-    def __init__(self, definition=definition.Definition()):
+    def __init__(self, definition=Definition()):
         self.definition = definition
         self._rel_label = definition.relation_label
         self._rep_label = definition.representing_node.label
         self._rep_rel_label = definition.rep_rel_label
         self._rep_name = definition.representing_node.name
         self._name_rule = definition.node_name_rule
+        self._vars_label = definition.vars_label
+        self._vars_rule = definition.vars_rule
 
     def list_inventory(self, session):
         node_info = {}
@@ -22,7 +25,7 @@ class Neo4jToAnsible:
         # find all nodes used in this ansible inventory
         cypher = "MATCH (a)<-[:{0}]-(b) WHERE ID(b) = {{id}} RETURN ID(a) as id, a.name as name, LABELS(a) as label".format(self._rep_rel_label)
         all_nodes = session.run(cypher, {"id": rep_id})
-        neo4j_node_list = [definition.Neo4jNodeInfo(x["label"][0], x["name"], id=x["id"]) for x in all_nodes]
+        neo4j_node_list = [Neo4jNode(x["label"][0], x["name"], id=x["id"]) for x in all_nodes]
 
         # create dictionary whose structure is equivalent to the dynamic inventory
         groups = {}
@@ -31,39 +34,23 @@ class Neo4jToAnsible:
             node = self._name_rule(neo4j_node)
 
             # get variables
-            var = {} # TODO: implement
+            var = self._vars_rule.from_neo4j(neo4j_node, session)
 
             if node.ansible_is_host:
                 hostvars[node.ansible_name] = var
             else:
                 # find child_groups of the node
                 cypher = "MATCH (a)-[:{0}]->(b)<-[:{1}]-(c)" \
-                         " WHERE ID(a) = {{id}} AND ID(c) = {{rep_id}}"\
+                         " WHERE ID(a) = {{id}} AND ID(c) = {{rep_id}}" \
                          " RETURN b.name as name, LABELS(b) as label".format(self._rel_label, self._rep_rel_label)
                 results = session.run(cypher, {"id": neo4j_node.id, "rep_id": rep_id})
-                children = [self._name_rule(definition.Neo4jNodeInfo(x["label"][0], x["name"])) for x in results]
+                children = [self._name_rule(Neo4jNode(x["label"][0], x["name"])) for x in results]
                 groups[node.ansible_name] = { "vars": var,
                                               "hosts": [x.ansible_name for x in children if x.ansible_is_host],
                                               "children": [x.ansible_name for x in children if not x.ansible_is_host] }
         groups["_meta"] = {"hostvars": hostvars}
         return groups
 
-
-    def _query_subvars(self, node_id):
-        cypher = "MATCH (a)-[p]->(b:{0}) WHERE ID(a) = {{id}}"\
-                 " RETURN type(p) as label, (p.index is not null) as islist,"\
-                 " b as var order by p.index".format(conf.vars_label)
-        sub_vars = session.run(cypher, {"id": node_id})
-        var = {}
-        for sub_var in sub_vars:
-            var_name = sub_var["label"]
-            if sub_var["islist"]:
-                if var_name not in var.keys():
-                    var[var_name] = []
-                var[var_name].append(dict(sub_var["var"]))
-            else:
-                var[var_name] = dict(sub_var["var"])
-        return var
 
 
     def list_hostvars(self, session, hostname):
@@ -79,11 +66,6 @@ class Neo4jToAnsible:
         host_result = session.run(cypher, {"name": hostname, "id": root_node_id})
         host = host_result.peek()
         host_prop = dict(host["property"])
-        # remove "name" vars because it is inserted by store.py
-        # to handle nodes in neo4j
-        if "name" in host_prop.keys():
-            del host_prop["name"]
-        sub_vars = self._query_subvars(host["id"])
         hostvars = {k: v for dic in [host_prop, sub_vars] for k, v in dic.items()}
         return hostvars
 
@@ -136,11 +118,11 @@ if __name__ == "__main__":
                                           args.neo4j_password)
     session = neo4j_driver.session()
 
-    dynamic_inventory = Neo4jToAnsible()
+    n2a = Neo4jToAnsible(user_def)
 
     if args.host:
-        print(json.dumps(dynamic_inventory.list_hostvars(session, args.host)))
+        print(json.dumps(n2a.list_hostvars(session, args.host)))
     elif args.list:
-        print(json.dumps(dynamic_inventory.list_inventory(session)))
+        print(json.dumps(n2a.list_inventory(session)))
 
     session.close()

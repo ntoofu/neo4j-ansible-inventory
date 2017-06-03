@@ -62,18 +62,10 @@ def _create_inventory_tree_in_neo4j(node_info, session, name_rules):
 
 
 def _create_subelement(session, name_rules, key, var, node_id, path_idx=None):
-    pass
-    query_str = ", ".join(["{0}: {{val}}.{0}".format(k) for k in var.keys()])
-    cypher = "MATCH (a:{0} {{{1}}})" \
-             " RETURN ID(a) as id".format(name_rules["vars_label"], query_str)
+    cypher = "CREATE (a:{0} {{val}})" \
+             " RETURN ID(a) as id".format(name_rules["vars_label"])
     vars_node = session.run(cypher, {"val": dict(var)})
-    try:
-        vars_node_id = vars_node.peek()["id"]
-    except neo4j.v1.exceptions.ResultError:
-        cypher = "CREATE (a:{0} {{val}})" \
-                 " RETURN ID(a) as id".format(name_rules["vars_label"])
-        vars_node = session.run(cypher, {"val": dict(var)})
-        vars_node_id = vars_node.peek()["id"]
+    vars_node_id = vars_node.peek()["id"]
     if path_idx is None:
         cypher = "MATCH (a), (b) WHERE ID(a) = {{nid}} AND ID(b) = {{vid}}" \
                  " CREATE (a)-[:{0}]->(b)".format(key)

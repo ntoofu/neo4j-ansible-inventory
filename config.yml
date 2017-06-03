@@ -1,0 +1,15 @@
+neo4j:
+  host: localhost
+  bolt_port: 7687
+  # user: neo4j   # necessary when Neo4j require authentication
+  # password: neo4j   # necessary when Neo4j require authentication
+ansible:
+  inventory_path: your_asnible_dir/inventory_dir/inventory_file
+  playbook_dir: your_asnible_dir
+  use_vault: false
+  # password: vault-password   # necessary when use_vault is true
+label_name:
+  group_label: ANSIBLE_GROUP
+  host_label: ANSIBLE_HOST
+  vars_label: ANSIBLE_VARS
+  inclusion_relation_type: HAS

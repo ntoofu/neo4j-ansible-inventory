@@ -7,13 +7,17 @@ from store import store
 
 class Neo4jAnsibleTestCase(unittest.TestCase):
     def setUp(self):
-        neo4j_driver = utils.connect_to_neo4j("localhost", 7687, "", "")
+        conf = utils.load_conf("test_config.yml")
+        neo4j_driver = utils.connect_to_neo4j(conf["neo4j"]["host"],
+                                              conf["neo4j"]["bolt_port"],
+                                              conf["neo4j"].get("user",None),
+                                              conf["neo4j"].get("password",None))
         session = neo4j_driver.session()
-        basedir = "ansibleutils/testdata/1"
-        inventory_path = "ansibleutils/testdata/1/inventory"
         self.static_inventory = load_ansible_inventory(
-                                    basedir, inventory_path, "")
-        store(session, self.static_inventory)
+                                    conf["ansible"]["playbook_dir"],
+                                    conf["ansible"]["inventory_path"],
+                                    None)
+        store(session, self.static_inventory, conf["label_name"])
         session.close()
 
     def test_same_inventories(self):

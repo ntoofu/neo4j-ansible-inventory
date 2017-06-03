@@ -1,8 +1,7 @@
 import utils
-import conf
 
 
-def list_inventory(session):
+def list_inventory(session, name_rules):
     node_info = {}
 
     def scan_node(neo4j_id):
@@ -11,13 +10,13 @@ def list_inventory(session):
         group_prop = group.peek()["property"]
         group_key = group_prop["name"]
         cypher = "MATCH (a)-[:{0}]->(b:{1}) WHERE ID(a) = {{id}}" \
-                 " RETURN ID(b) as id".format(conf.relation_label,
-                                              conf.group_label)
+                 " RETURN ID(b) as id".format(name_rules["inclusion_relation_type"],
+                                              name_rules["group_label"])
         children = session.run(cypher, {"id": neo4j_id})
         children_id = [x["id"] for x in children]
         cypher = "MATCH (a)-[:{0}]->(b:{1}) WHERE ID(a) = {{id}}" \
-                 " RETURN b.name as name".format(conf.relation_label,
-                                                 conf.host_label)
+                 " RETURN b.name as name".format(name_rules["inclusion_relation_type"],
+                                                 name_rules["host_label"])
         hosts = session.run(cypher, {"id": neo4j_id})
         hosts_name = [x["name"] for x in hosts]
         node_info[neo4j_id] = {
@@ -33,7 +32,7 @@ def list_inventory(session):
 
     # find the group "all" as root node
     cypher = "MATCH (a:{0} {{name: 'all'}})" \
-             " RETURN ID(a) as id".format(conf.group_label)
+             " RETURN ID(a) as id".format(name_rules["group_label"])
     root_node = session.run(cypher)
     root_node_id = root_node.peek()["id"]
 
@@ -48,7 +47,7 @@ def list_inventory(session):
         if "name" in val["vars"].keys():
             del val["vars"]["name"]
         # search sub var
-        sub_vars = query_subvars(key)
+        sub_vars = query_subvars(key, name_rules)
         group_inventory[val["key"]] = {
                 "vars": {k: v for dic in [val["vars"], sub_vars]
                          for k, v in dic.items()},
@@ -59,14 +58,14 @@ def list_inventory(session):
     group_inventory["ungrouped"] = []
 
     # add '_meta' information
-    group_inventory["_meta"] = {"hostvars": list_all_hostvars(session)}
+    group_inventory["_meta"] = {"hostvars": list_all_hostvars(session, name_rules)}
     return group_inventory
 
 
-def query_subvars(node_id):
+def query_subvars(node_id, name_rules):
     cypher = "MATCH (a)-[p]->(b:{0}) WHERE ID(a) = {{id}}"\
              " RETURN type(p) as label, (p.index is not null) as islist,"\
-             " b as var order by p.index".format(conf.vars_label)
+             " b as var order by p.index".format(name_rules["vars_label"])
     sub_vars = session.run(cypher, {"id": node_id})
     var = {}
     for sub_var in sub_vars:
@@ -80,16 +79,16 @@ def query_subvars(node_id):
     return var
 
 
-def list_hostvars(session, hostname):
+def list_hostvars(session, name_rules, hostname):
     # find the group "all" as root node
     cypher = "MATCH (a:{0} {{name: 'all'}})" \
-             " RETURN ID(a) as id".format(conf.group_label)
+             " RETURN ID(a) as id".format(name_rules["group_label"])
     root_node = session.run(cypher)
     root_node_id = root_node.peek()["id"]
 
     cypher = "MATCH (a)-[:{0}*]->(b:{1} {{name: {{name}}}})" \
              " WHERE ID(a) = {{id}} RETURN ID(b) AS id," \
-             " b AS property".format(conf.relation_label, conf.host_label)
+             " b AS property".format(name_rules["inclusion_relation_type"], name_rules["host_label"])
     host_result = session.run(cypher, {"name": hostname, "id": root_node_id})
     host = host_result.peek()
     host_prop = dict(host["property"])
@@ -97,21 +96,21 @@ def list_hostvars(session, hostname):
     # to handle nodes in neo4j
     if "name" in host_prop.keys():
         del host_prop["name"]
-    sub_vars = query_subvars(host["id"])
+    sub_vars = query_subvars(host["id"], name_rules)
     hostvars = {k: v for dic in [host_prop, sub_vars] for k, v in dic.items()}
     return hostvars
 
 
-def list_all_hostvars(session):
+def list_all_hostvars(session, name_rules):
     # find the group "all" as root node
     cypher = "MATCH (a:{0} {{name: 'all'}})" \
-             " RETURN ID(a) as id".format(conf.group_label)
+             " RETURN ID(a) as id".format(name_rules["group_label"])
     root_node = session.run(cypher)
     root_node_id = root_node.peek()["id"]
 
     cypher = "MATCH (a)-[:{0}*]->(b:{1}) WHERE ID(a) = {{id}}" \
-             " RETURN ID(b) as id, b AS property".format(conf.relation_label,
-                                                         conf.host_label)
+             " RETURN ID(b) as id, b AS property".format(name_rules["inclusion_relation_type"],
+                                                         name_rules["host_label"])
     hosts = session.run(cypher, {"id": root_node_id})
     hostvars = {}
     for host in hosts:
@@ -120,7 +119,7 @@ def list_all_hostvars(session):
         # to handle nodes in neo4j
         if "name" in host_prop.keys():
             del host_prop["name"]
-        sub_vars = query_subvars(host["id"])
+        sub_vars = query_subvars(host["id"], name_rules)
         host_key = host["property"]["name"]
         hostvars[host_key] = {k: v for dic in [host_prop, sub_vars]
                               for k, v in dic.items()}
@@ -129,34 +128,19 @@ def list_all_hostvars(session):
 
 if __name__ == "__main__":
     import argparse
+    import getpass
     import json
 
-    parser = argparse.ArgumentParser(
-                description='Arguments for talking to vCenter')
-    parser.add_argument('-n', '--neo4j-host',
-                        default='localhost',
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config',
+                        default='config.yml',
                         action='store',
-                        help='Neo4j service to connect to')
-
-    parser.add_argument('-o', '--neo4j-port',
-                        type=int,
-                        default=7687,
-                        action='store',
-                        help='Port to connect on with bolt')
-
-    parser.add_argument('-u', '--neo4j-user',
-                        required=False,
-                        action='store',
-                        help='Username to use')
-
-    parser.add_argument('-p', '--neo4j-password',
-                        required=False,
-                        action='store',
-                        help='Password to use')
+                        help='config file path')
 
     parser.add_argument('-H', '--host',
-                        default=None,
-                        help='inventory hostname whose hostvars will be shown')
+                        default=False,
+                        action='store',
+                        help='host name to be shown')
 
     parser.add_argument('-l', '--list',
                         default=False,
@@ -165,18 +149,20 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.neo4j_user and not args.neo4j_password:
-        args.neo4j_password = getpass.getpass(prompt='Enter password')
+    conf = utils.load_conf(args.config)
 
-    neo4j_driver = utils.connect_to_neo4j(args.neo4j_host,
-                                          args.neo4j_port,
-                                          args.neo4j_user,
-                                          args.neo4j_password)
+    if "user" in conf["neo4j"].keys() and "password" not in conf["neo4j"].keys():
+        conf["neo4j"]["password"] = getpass.getpass(prompt='Enter Neo4j password')
+
+    neo4j_driver = utils.connect_to_neo4j(conf["neo4j"]["host"],
+                                          conf["neo4j"]["bolt_port"],
+                                          conf["neo4j"].get("user",None),
+                                          conf["neo4j"].get("password",None))
     session = neo4j_driver.session()
 
     if args.host:
-        print(json.dumps(list_hostvars(session, args.host)))
+        print(json.dumps(list_hostvars(session, conf["label_name"], args.host)))
     elif args.list:
-        print(json.dumps(list_inventory(session)))
+        print(json.dumps(list_inventory(session, conf["label_name"])))
 
     session.close()

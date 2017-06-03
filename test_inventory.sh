@@ -1,3 +1,3 @@
 #!/bin/sh
 
-python inventory.py -n localhost $@
+python inventory.py -c test_config.yml $@

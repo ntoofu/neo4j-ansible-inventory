@@ -1,0 +1,14 @@
+var1: fugafuga
+var2: 256
+var3: 1
+list1:
+  - foox
+  - barx
+  - bazx
+dicts:
+  - a: 2
+    b: 3
+    c: 4
+  - a: 11
+    b: 21
+    d: 41

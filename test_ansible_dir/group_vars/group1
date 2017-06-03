@@ -1,0 +1,13 @@
+var1: hogehoge
+var2: 123
+list1:
+  - foo
+  - bar
+  - baz
+dicts:
+  - a: 1
+    b: 2
+    c: 3
+  - a: 10
+    b: 20
+    d: 40
